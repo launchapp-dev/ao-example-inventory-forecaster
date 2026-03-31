@@ -1,0 +1,39 @@
+suppliers:
+  acme-tools:
+    name: "Acme Tool Supply"
+    contact_email: "orders@acme-tools.example.com"
+    skus_pattern: "WH-TOOL-*"
+    min_order_quantity: 50
+    lead_time_days: 14
+    payment_terms: "net-30"
+    priority_supplier: false
+
+  volt-electronics:
+    name: "Volt Electronics Inc."
+    contact_email: "procurement@volt-elec.example.com"
+    skus_pattern: "WH-ELEC-*"
+    min_order_quantity: 25
+    lead_time_days: 21
+    payment_terms: "net-45"
+    priority_supplier: false
+    notes: "Holiday season orders (Sept–Oct) require 30-day advance notice"
+
+  safeguard-co:
+    name: "SafeGuard Supply Co."
+    contact_email: "ops@safeguard.example.com"
+    skus_pattern: "WH-SAFE-*"
+    min_order_quantity: 100
+    lead_time_days: 7
+    payment_terms: "net-15"
+    priority_supplier: true
+    notes: "Preferred supplier for critical safety stock — expedited shipping available"
+
+  greenfield-outdoor:
+    name: "Greenfield Outdoor Gear"
+    contact_email: "wholesale@greenfield.example.com"
+    skus_pattern: "WH-OUTD-*"
+    min_order_quantity: 30
+    lead_time_days: 28
+    payment_terms: "net-30"
+    priority_supplier: false
+    notes: "Spring orders (Feb–Mar) must be placed early to secure summer inventory"

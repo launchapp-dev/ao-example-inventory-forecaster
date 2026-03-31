@@ -1,0 +1,55 @@
+default_workflow_ref: demand-forecast
+
+workflows:
+  - id: demand-forecast
+    name: "Demand Forecasting Pipeline"
+    description: "Full pipeline: ingest sales data, analyze trends, generate forecasts, review reorder urgency, issue purchase orders, compile report"
+    phases:
+      - ingest-sales-data
+      - normalize-data
+      - analyze-trends
+      - generate-forecasts
+      - review-reorder-urgency:
+          on_verdict:
+            monitor:
+              target: generate-monitoring-report
+            rework:
+              target: generate-forecasts
+          max_rework_attempts: 2
+      - generate-purchase-orders
+      - generate-monitoring-report
+      - compile-forecast-report
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: true
+        auto_merge: true
+        cleanup_worktree: true
+
+  - id: weekly-forecast-refresh
+    name: "Weekly Forecast Refresh"
+    description: "Scheduled weekly re-run of the full demand forecast pipeline on latest sales data"
+    phases:
+      - ingest-sales-data
+      - normalize-data
+      - analyze-trends
+      - generate-forecasts
+      - review-reorder-urgency:
+          on_verdict:
+            monitor:
+              target: generate-monitoring-report
+            rework:
+              target: generate-forecasts
+          max_rework_attempts: 2
+      - generate-purchase-orders
+      - generate-monitoring-report
+      - compile-forecast-report
+
+  - id: sku-health-audit
+    name: "SKU Forecast Accuracy Audit"
+    description: "On-demand audit comparing actual sales against forecast predictions to measure and improve accuracy"
+    phases:
+      - scan-inventory
+      - compare-actuals-vs-forecast
+      - compile-accuracy-report

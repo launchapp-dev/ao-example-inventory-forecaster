@@ -1,0 +1,477 @@
+phases:
+  # ─── demand-forecast workflow phases ─────────────────────────────────────────
+
+  ingest-sales-data:
+    mode: command
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    command:
+      program: bash
+      args:
+        - "-c"
+        - |
+          set -euo pipefail
+
+          mkdir -p data/normalized data/forecasts data/reorder-points \
+                   output/purchase-orders output/reports output/alerts \
+                   data/audit
+
+          # Initialize files if missing
+          [ -f "data/audit-log.json" ] || echo '[]' > data/audit-log.json
+
+          # Run validation script
+          bash scripts/validate-sales-data.sh
+
+          # Log ingest start
+          RUN_ID="run-$(date +%Y%m%dT%H%M%S)"
+          python3 -c "
+          import json, datetime
+          log = json.load(open('data/audit-log.json'))
+          log.append({
+            'run_id': '$RUN_ID',
+            'started_at': datetime.datetime.utcnow().isoformat() + 'Z',
+            'phase': 'ingest-sales-data',
+            'status': 'started'
+          })
+          json.dump(log, open('data/audit-log.json', 'w'), indent=2)
+          print('Run ID: $RUN_ID')
+          "
+          echo "$RUN_ID" > data/.current-run-id
+          echo "Ingest phase initialized. Run ID: $RUN_ID"
+      cwd_mode: project_root
+      timeout_secs: 60
+
+  normalize-data:
+    mode: agent
+    agent: data-ingester
+    directive: |
+      Parse and normalize all sales data files in data/sales-history/ into a single
+      unified sales record file at data/normalized/unified-sales.json.
+
+      Steps:
+      1. List all CSV and JSON files in data/sales-history/ using filesystem MCP
+      2. For each file, parse the records and validate required columns:
+         date, sku, quantity, unit_price, channel, region
+      3. Normalize each record:
+         - Parse dates to ISO8601 format (YYYY-MM-DD)
+         - Uppercase SKU codes, validate format (WH-[A-Z]+-[0-9]+)
+         - Compute revenue = quantity * unit_price (round to 2 decimals)
+         - Add derived fields: week_number (ISO week), month (YYYY-MM), quarter (YYYY-QN)
+         - Normalize channel to lowercase: online, retail, wholesale, marketplace
+         - Normalize region to lowercase: northeast, southeast, midwest, west, southwest
+      4. Deduplicate: if same (date, sku, channel) appears twice, keep first and log a warning
+      5. Sort records by date ascending, then by sku alphabetically
+
+      Write to data/normalized/unified-sales.json:
+      {
+        "generated_at": "<ISO8601>",
+        "source_files": ["sales-2025-q3.csv", "sales-2025-q4.csv"],
+        "stats": {
+          "records_parsed": 1420,
+          "records_skipped": 3,
+          "duplicates_found": 1,
+          "date_range": {"start": "2025-07-01", "end": "2025-12-31"},
+          "unique_skus": 42,
+          "unique_channels": 4
+        },
+        "warnings": ["Duplicate record: 2025-10-15 WH-ELEC-2050 retail"],
+        "records": [
+          {
+            "date": "2025-07-01",
+            "sku": "WH-TOOL-1001",
+            "quantity": 45,
+            "unit_price": 29.99,
+            "revenue": 1349.55,
+            "channel": "online",
+            "region": "northeast",
+            "week_number": "2025-W27",
+            "month": "2025-07",
+            "quarter": "2025-Q3"
+          }
+        ]
+      }
+
+      After writing, print a summary of ingestion stats for the pipeline log.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  analyze-trends:
+    mode: agent
+    agent: trend-analyzer
+    directive: |
+      Analyze the normalized sales data at data/normalized/unified-sales.json to detect
+      seasonal patterns, demand trends, and statistical properties per SKU.
+
+      Use sequential-thinking MCP to structure your reasoning for each SKU category.
+      Read config/sku-categories.yaml for expected seasonality behavior per category prefix.
+      Read config/forecasting-params.yaml for confidence thresholds and settings.
+
+      For each unique SKU in the sales data:
+      1. Calculate base metrics:
+         - Average daily demand (units/day) over the full data period
+         - Standard deviation of daily demand
+         - Coefficient of variation (CV = σ/μ) — higher means more volatile
+         - Total revenue contribution over the period
+      2. Detect seasonal patterns:
+         - Compare monthly averages to overall average — flag months ≥ 20% above/below
+         - Compare Q3 vs Q4 averages for electronics and outdoor categories
+         - Identify week-of-month patterns (first week vs last week of month)
+      3. Trend detection:
+         - Calculate month-over-month growth rate for last 3 months
+         - Classify trend: growing (>5%/mo), stable (-5% to +5%/mo), declining (<-5%/mo)
+      4. Anomaly detection:
+         - Zero-demand periods > 7 days during expected demand windows = likely stockout
+         - Single-day spikes > 3× average = likely promotional event, exclude from baseline
+      5. Confidence scoring:
+         - High (≥0.8): ≥ 90 days data, CV < 0.5, no anomalies
+         - Medium (0.5–0.79): 60–89 days data OR CV 0.5–0.8
+         - Low (<0.5): < 60 days data OR CV > 0.8
+
+      For ambiguous SKUs (confidence < 0.6), use sequential-thinking to reason through
+      the available evidence and choose the most defensible forecast approach.
+
+      Write to data/forecasts/trend-analysis.json:
+      {
+        "generated_at": "<ISO8601>",
+        "analysis_period": {"start": "...", "end": "..."},
+        "skus": {
+          "WH-TOOL-1001": {
+            "avg_daily_demand": 1.45,
+            "demand_stddev": 0.38,
+            "cv": 0.26,
+            "trend": "stable",
+            "monthly_growth_rate": 0.02,
+            "seasonal_pattern": "low",
+            "peak_months": [],
+            "anomalies_detected": [],
+            "confidence": "high",
+            "confidence_score": 0.87,
+            "total_revenue": 39250.45
+          }
+        }
+      }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  generate-forecasts:
+    mode: agent
+    agent: demand-forecaster
+    directive: |
+      Generate 90-day demand forecasts, reorder points, and safety stock levels for all SKUs.
+
+      Read:
+      - data/forecasts/trend-analysis.json (trend and seasonal factors per SKU)
+      - data/normalized/unified-sales.json (raw sales for base demand calculation)
+      - config/forecasting-params.yaml (forecast horizon, safety stock multiplier, methods)
+      - config/sku-categories.yaml (lead times, criticality flags per category)
+      - config/supplier-catalog.yaml (supplier MOQs, lead times, payment terms)
+
+      For each SKU:
+      1. Compute 90-day forecast:
+         - Base = avg_daily_demand × 90 days
+         - Apply seasonal_factor for months in the forecast window
+         - Apply trend multiplier (growing: ×1.05/mo, stable: ×1.0, declining: ×0.95/mo)
+         - confidence_interval: high → ±10%, medium → ±20%, low → ±35%
+
+      2. Calculate reorder point (using EOQ method unless overridden):
+         reorder_point = (avg_daily_demand × lead_time_days) + safety_stock
+         safety_stock = safety_stock_multiplier × demand_stddev × sqrt(lead_time_days)
+
+      3. Determine current stock urgency:
+         Read data/reorder-points/current-stock.json if it exists for current stock levels.
+         If no current stock file, assume stock = 2 × reorder_point (healthy baseline).
+         - immediate: current_stock ≤ reorder_point
+         - scheduled: current_stock ≤ 2 × reorder_point
+         - healthy: current_stock > 2 × reorder_point
+         - WH-SAFE-* override: never "healthy" unless stock > 3 × reorder_point
+
+      4. Calculate recommended order quantity:
+         eoq = sqrt((2 × annual_demand × order_cost) / holding_cost_rate)
+         Use order_cost=$25, holding_cost_rate=0.25 if not in config.
+         recommended_qty = max(eoq, supplier_moq)
+
+      Write to data/forecasts/forecast-latest.json and data/reorder-points/reorder-points.json.
+      Also write output/purchase-orders/po-draft-{date}.json with consolidated PO recommendations
+      grouped by supplier.
+
+      Use the exact schema described in CLAUDE.md for all output files.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  review-reorder-urgency:
+    mode: agent
+    agent: procurement-reviewer
+    directive: |
+      Review the generated demand forecasts and reorder analysis. Apply procurement
+      judgment to classify overall urgency and approve (or reject) the forecast quality.
+
+      Read:
+      - data/forecasts/forecast-latest.json
+      - data/reorder-points/reorder-points.json
+      - output/purchase-orders/po-draft-{date}.json (most recent file in output/purchase-orders/)
+      - config/supplier-catalog.yaml (supplier constraints)
+      - config/forecasting-params.yaml (confidence thresholds)
+
+      Apply review criteria in order:
+      1. CRITICAL SAFETY CHECK: If ANY WH-SAFE-* SKU is at "immediate" urgency → verdict: immediate
+      2. QUALITY CHECK: If ≥ 20% of A-tier SKUs have confidence_score < 0.7 → verdict: rework
+         Include specific SKUs and what's wrong in your reasoning.
+      3. IMPLAUSIBILITY CHECK: If any SKU's 90-day forecast is > 5× its historical average
+         without a documented seasonal reason → verdict: rework
+      4. URGENCY ESCALATION: If total PO value > $50,000 → note in reasoning (still proceed)
+      5. STANDARD ROUTING:
+         - Any SKU at "immediate" urgency → verdict: immediate
+         - Any SKU at "scheduled" urgency (none at immediate) → verdict: scheduled
+         - All SKUs "healthy" → verdict: monitor
+
+      Output the decision contract as the final line of your response:
+      {"verdict": "immediate|scheduled|monitor|rework", "reasoning": "...", "immediate_count": N, "scheduled_count": N, "healthy_count": N, "total_po_value": 0.00, "confidence": "high|medium|low"}
+    capabilities:
+      mutates_state: false
+      writes_files: false
+    decision_contract:
+      required_fields: [verdict, reasoning, immediate_count, scheduled_count, healthy_count, total_po_value, confidence]
+
+  generate-purchase-orders:
+    mode: agent
+    agent: demand-forecaster
+    directive: |
+      Generate finalized purchase orders from the draft PO recommendations.
+      The procurement-reviewer has approved the forecasts — now produce formal PO documents.
+
+      Read:
+      - output/purchase-orders/po-draft-{date}.json (most recent draft)
+      - config/supplier-catalog.yaml (supplier contact info, payment terms)
+      - data/reorder-points/reorder-points.json (reorder urgency per SKU)
+
+      For each supplier with SKUs requiring orders:
+      1. Group all immediate-urgency SKUs into a RUSH order (delivery ASAP)
+      2. Group all scheduled-urgency SKUs into a STANDARD order (standard lead time)
+      3. Apply supplier MOQ — round up order quantities to nearest MOQ multiple
+      4. Calculate order totals: unit_price × quantity (use avg unit_price from sales data)
+      5. Assign expected delivery date: today + lead_time_days + lead_time_buffer_days
+
+      Write one PO file per supplier to output/purchase-orders/:
+      Filename: po-{supplier-id}-{YYYY-MM-DD}.json
+
+      PO schema:
+      {
+        "po_number": "PO-{YYYYMMDD}-{supplier_id}",
+        "generated_at": "<ISO8601>",
+        "urgency": "rush|standard",
+        "supplier": {
+          "id": "acme-tools",
+          "name": "Acme Tool Supply",
+          "payment_terms": "net-30"
+        },
+        "expected_delivery": "2026-04-15",
+        "line_items": [
+          {
+            "sku": "WH-TOOL-1001",
+            "description": "Tool SKU 1001",
+            "quantity_ordered": 150,
+            "unit_price": 29.99,
+            "line_total": 4498.50,
+            "urgency": "immediate",
+            "reorder_point": 45,
+            "current_stock": 38
+          }
+        ],
+        "subtotal": 4498.50,
+        "total_items": 1,
+        "notes": "Rush order — critical stock level"
+      }
+
+      After writing all PO files, update data/audit-log.json with a summary entry.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  generate-monitoring-report:
+    mode: agent
+    agent: report-generator
+    directive: |
+      Generate a monitoring and health dashboard report for the current inventory state.
+      This phase runs when all SKUs are healthy (monitor verdict) OR after purchase orders
+      have been generated to provide a complete view of inventory status.
+
+      Read:
+      - data/forecasts/forecast-latest.json
+      - data/reorder-points/reorder-points.json
+      - data/forecasts/trend-analysis.json
+      - data/audit-log.json (for run history)
+      - output/purchase-orders/ (list any POs generated this run)
+      - config/sku-categories.yaml
+
+      Generate output/reports/monitoring-{YYYY-MM-DD}.md with:
+
+      ## Header
+      - Report date, data period covered, total SKUs monitored
+
+      ## Executive Summary
+      - Overall inventory health: X% healthy, Y% at reorder threshold, Z% critical
+      - POs generated this run (if any): count, total value, suppliers involved
+
+      ## SKU Health by Category
+      Table per category (tools, electronics, safety, outdoor):
+      | SKU | Avg Daily Demand | Days of Stock | Status | Next Review |
+      Show ≤ 20 SKUs per category, sorted by days_of_stock ascending.
+
+      ## Trend Highlights
+      - Top 3 growing SKUs (highest monthly growth rate)
+      - Top 3 declining SKUs (most negative monthly growth rate)
+      - SKUs with high volatility (CV > 0.5) that need watching
+
+      ## Forecast Confidence Summary
+      - High confidence: N SKUs (%)
+      - Medium confidence: N SKUs (%)
+      - Low confidence: N SKUs (%) — list by name for follow-up
+
+      ## Next Actions
+      - Recommended next review date based on most urgent reorder point
+      - SKUs to watch (approaching scheduled threshold within 14 days)
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  compile-forecast-report:
+    mode: agent
+    agent: report-generator
+    directive: |
+      Compile the final comprehensive forecast report for this pipeline run.
+      This is the authoritative output document for warehouse managers.
+
+      Read ALL output from this run:
+      - data/forecasts/forecast-latest.json (SKU forecasts)
+      - data/reorder-points/reorder-points.json (reorder decisions)
+      - output/purchase-orders/ (list all PO files generated)
+      - output/reports/monitoring-{today}.md (monitoring report if it exists)
+      - data/audit-log.json (run metadata)
+      - data/normalized/unified-sales.json (ingestion stats)
+
+      Also run the forecast diff script to compare with previous run:
+      (Read any previous forecast file in data/forecasts/ other than forecast-latest.json)
+
+      Generate output/reports/forecast-{YYYY-MM-DD}.md with these sections:
+
+      ## 1. Executive Summary
+      - Pipeline run ID and timestamp
+      - Data period analyzed (start → end)
+      - Total SKUs: N analyzed, N with forecasts, N requiring orders
+      - Procurement action: RUSH ORDERS REQUIRED | STANDARD ORDERS QUEUED | MONITORING ONLY
+      - Total PO value for this run
+
+      ## 2. Demand Forecast Summary
+      Full table of all SKUs:
+      | SKU | Category | Avg Daily Demand | 90-Day Forecast | Confidence | Trend |
+      Sort by category, then by urgency (immediate first)
+
+      ## 3. Reorder Alerts
+      Only SKUs at "immediate" or "scheduled" urgency:
+      | SKU | Current Stock | Reorder Point | Days Until Stockout | Recommended Order Qty | Supplier |
+
+      ## 4. Purchase Orders Issued
+      For each PO file generated:
+      | PO Number | Supplier | Items | Total Value | Expected Delivery | Urgency |
+
+      ## 5. Forecast vs. Previous Period
+      If a previous forecast exists, show comparison:
+      | SKU | Previous Forecast | Current Forecast | Change | Notes |
+
+      ## 6. Data Quality Notes
+      - Ingestion warnings from normalize-data phase
+      - Low-confidence SKUs and why
+      - Anomalies detected
+
+      ## 7. Methodology
+      Brief explanation of forecast method, confidence intervals, safety stock formula.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  # ─── sku-health-audit workflow phases ────────────────────────────────────────
+
+  scan-inventory:
+    mode: command
+    capabilities:
+      mutates_state: true
+      writes_files: true
+    command:
+      program: bash
+      args: ["-c", "bash scripts/scan-inventory.sh"]
+      cwd_mode: project_root
+      timeout_secs: 120
+
+  compare-actuals-vs-forecast:
+    mode: agent
+    agent: trend-analyzer
+    directive: |
+      Compare actual sales recorded since the last forecast run against what was predicted.
+      This is the accuracy audit phase — your goal is to measure forecast quality.
+
+      Read:
+      - data/normalized/unified-sales.json (actual sales records)
+      - data/forecasts/forecast-latest.json (what was predicted)
+      - data/forecasts/trend-analysis.json (trend assumptions that drove the forecast)
+      - data/audit-log.json (to find the date of the last forecast run)
+
+      For each SKU in the forecast:
+      1. Find actual sales records for the period AFTER the forecast was generated
+      2. Calculate actuals vs. forecast per period (weekly):
+         - Forecast units for that week (from 90-day forecast, prorated)
+         - Actual units sold that week (from sales records)
+         - Error = actual - forecast
+         - APE (Absolute Percentage Error) = |error| / forecast × 100
+      3. Calculate MAPE (Mean APE) per SKU and per category
+      4. Classify accuracy: Excellent (<10% MAPE), Good (10–20%), Fair (20–35%), Poor (>35%)
+      5. For Poor performers, use sequential-thinking to diagnose root cause:
+         - Was it a stockout masking true demand?
+         - Was there an undetected seasonal effect?
+         - Was the base demand calculation off?
+
+      Write to data/audit/accuracy-{YYYY-MM-DD}.json with full comparison data.
+    capabilities:
+      mutates_state: true
+      writes_files: true
+
+  compile-accuracy-report:
+    mode: agent
+    agent: report-generator
+    directive: |
+      Generate an accuracy audit report from the actuals vs. forecast comparison.
+
+      Read:
+      - data/audit/accuracy-{today}.json (most recent file in data/audit/)
+      - data/forecasts/trend-analysis.json
+      - config/sku-categories.yaml
+
+      Generate output/reports/accuracy-{YYYY-MM-DD}.md with:
+
+      ## 1. Accuracy Summary
+      - Overall MAPE across all SKUs
+      - Accuracy by category (tools, electronics, safety, outdoor)
+      - Accuracy distribution: N Excellent, N Good, N Fair, N Poor
+
+      ## 2. Best Performing SKUs (lowest MAPE)
+      Table of top 10 most accurate forecasts
+
+      ## 3. Worst Performing SKUs (highest MAPE)
+      Table of bottom 10 with root cause diagnosis from trend-analyzer
+
+      ## 4. Systematic Biases
+      - Consistently over-forecast categories (over-ordering risk)
+      - Consistently under-forecast categories (stockout risk)
+      - Recommendations to correct bias in next forecast cycle
+
+      ## 5. Recommendations
+      Specific, actionable changes to improve forecast accuracy:
+      - SKUs that need more historical data
+      - Categories where seasonality model needs tuning
+      - External signals to add (holidays, events) for electronics and outdoor gear
+    capabilities:
+      mutates_state: true
+      writes_files: true

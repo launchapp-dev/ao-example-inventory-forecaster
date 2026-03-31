@@ -1,0 +1,42 @@
+categories:
+  tools:
+    prefix: "WH-TOOL"
+    description: "Hand tools, power tools, and hardware"
+    seasonality: low
+    default_lead_time_days: 14
+    abc_tier: B
+    critical: false
+
+  electronics:
+    prefix: "WH-ELEC"
+    description: "Consumer electronics, accessories, and components"
+    seasonality: high
+    default_lead_time_days: 21
+    abc_tier: A
+    critical: false
+    seasonal_peaks:
+      - months: [10, 11, 12]
+        demand_multiplier: 1.40   # Q4 holiday spike
+
+  safety:
+    prefix: "WH-SAFE"
+    description: "Safety equipment — PPE, fire suppression, first aid"
+    seasonality: none
+    default_lead_time_days: 7
+    abc_tier: A
+    critical: true                # Never allow stockout — regulatory requirement
+    min_stock_months: 3           # Always maintain 3 months of supply
+
+  outdoor:
+    prefix: "WH-OUTD"
+    description: "Outdoor gear, sporting equipment, seasonal items"
+    seasonality: high
+    default_lead_time_days: 28
+    abc_tier: B
+    critical: false
+    seasonal_peaks:
+      - months: [5, 6, 7, 8]
+        demand_multiplier: 1.60   # Summer peak
+    seasonal_valleys:
+      - months: [11, 12, 1, 2]
+        demand_multiplier: 0.50   # Winter low

@@ -1,0 +1,29 @@
+forecast_horizon_days: 90
+safety_stock_multiplier: 1.5
+reorder_point_method: eoq         # eoq | fixed-period | min-max
+seasonality_detection: true
+confidence_threshold: 0.70
+lead_time_buffer_days: 3
+
+# EOQ cost parameters
+order_cost_usd: 25.00
+holding_cost_rate: 0.25           # 25% of unit value per year
+
+# ABC classification thresholds (by cumulative revenue share)
+abc_classification:
+  a_threshold: 0.80               # Top 80% of revenue = A tier
+  b_threshold: 0.95               # Next 15% = B tier
+  c_threshold: 1.00               # Bottom 5% = C tier
+
+# Service level targets by ABC tier
+service_levels:
+  a_tier: 0.98                    # 98% → Z-score 2.05
+  b_tier: 0.95                    # 95% → Z-score 1.65
+  c_tier: 0.90                    # 90% → Z-score 1.28
+
+# Anomaly detection thresholds
+anomaly_spike_multiplier: 3.0     # Demand spike > 3× avg = promotional event
+anomaly_gap_days: 7               # Zero demand > 7 days = likely stockout
+
+# PO escalation threshold
+po_escalation_threshold_usd: 50000.00

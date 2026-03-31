@@ -1,0 +1,10 @@
+schedules:
+  - id: weekly-forecast-refresh
+    cron: "0 6 * * 1"
+    workflow_ref: weekly-forecast-refresh
+    enabled: true
+
+  - id: monthly-accuracy-audit
+    cron: "0 7 1 * *"
+    workflow_ref: sku-health-audit
+    enabled: true
